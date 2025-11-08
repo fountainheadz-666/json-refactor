@@ -107,7 +107,9 @@ if isInDDOpen = 1 then do
     Address TSO "EXECIO 1 DISKR "inDD" (STEM R."
     if rc <> 0 then leave
 
+    /* Read the record line */
     rec = R.1
+
     key_v = strip(substr(rec, 37, 9))  /* Extract key from record */
     /*A_v = strip(substr(rec, 37, 3))   Extract key from record */
     memb = routeMember(key_v)     /* Get layout member from MAPFILE*/
@@ -709,6 +711,8 @@ parseCopybook: procedure expose layouts. L.
       select
         when usageW = 'COMP-3' | usageW = 'PACKED-DECIMAL' then
           usage_v = 'COMP-3'
+        when usageW = 'COMP-5' then
+          usage_v = 'COMP-5'
         when usageW = 'COMP'   | usageW = 'BINARY'         then
           usage_v = 'COMP'
         when usageW = 'POINTER' then
@@ -720,6 +724,8 @@ parseCopybook: procedure expose layouts. L.
     else do
       if pos(' COMP-3 ', temp) > 0 | pos(' PACKED-DECIMAL ', temp) > 0 then
         usage_v = 'COMP-3'
+      else if pos(' COMP-5 ', temp) > 0 then
+        usage_v = 'COMP-5'
       else if pos(' COMP ', temp) > 0 | pos(' BINARY ', temp) > 0 then
         usage_v = 'COMP'
       else if pos(' POINTER ', temp) > 0 then
@@ -740,6 +746,12 @@ parseCopybook: procedure expose layouts. L.
           bytes_v = (totNibbles + 1) % 2 /* integer division -> ceil */
         end
         when usage_v = 'COMP' then do
+          tot = digit_v + decs_v
+          if tot <= 4 then bytes_v=2
+          else if tot <= 9 then bytes_v=4
+          else bytes_v=8
+        end
+        when usage_v = 'COMP-5' then do
           tot = digit_v + decs_v
           if tot <= 4 then bytes_v=2
           else if tot <= 9 then bytes_v=4
@@ -996,7 +1008,9 @@ parseNode: procedure expose layouts. jsonPairs recOff rec ctVar. ctVar_keys. ctV
       arrCountToEmit = min(occ, ctFromCtVar)
     end
 
+    /*
     say 'DBG mode = ' mode ' group=' name'-CT occ=' occ ' ctEmit=' ctEmit ' emit=' arrCountToEmit
+    */
 
     /* === SINGLE (no array) === */
     if wantArray = 0 then do
@@ -1219,7 +1233,11 @@ parseScalar: procedure
       end
       return val
     end
-
+    when usage = 'COMP-5' then do
+      val = binToDecSigned(raw)
+      if decs > 0 then return formatDecimal(val, decs)
+      return val
+    end
     otherwise do
       s = strip(raw, 'T')
 
@@ -1278,6 +1296,24 @@ binToDec: procedure
   len = length(raw)
 return c2d(raw, len)
 
+/* COMP-5: Signed two's-complement big-endian to decimal */
+binToDecSigned: procedure
+  parse arg raw
+  len = length(raw)
+  if len = 0 then return 0
+  unsigned = c2d(raw, len)
+
+  /* high-bit of first byte indicates sign in two's complement */
+  hi = c2d(substr(raw,1,1),1)
+  if hi >= 128 then do                /* negative */
+    limit = 1
+    do i = 1 to len
+      limit = limit * 256
+    end
+    return unsigned - limit
+  end
+  else return unsigned
+
 /* Format any decimal value */
 formatDecimal: procedure
   parse arg val, decs
@@ -1311,7 +1347,7 @@ depLookup: procedure
       return dep.short.k
   end
 return 0
-            
+
 maybeRemember: procedure
   parse arg short, full, val, pictype, usage
 /*if datatype(val,'N') | pos('.',val)>0 | left(val,1)='-' then do
