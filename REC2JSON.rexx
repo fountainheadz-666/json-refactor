@@ -1311,7 +1311,7 @@ depLookup: procedure
       return dep.short.k
   end
 return 0
-             save
+            
 maybeRemember: procedure
   parse arg short, full, val, pictype, usage
 /*if datatype(val,'N') | pos('.',val)>0 | left(val,1)='-' then do
