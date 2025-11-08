@@ -48,7 +48,7 @@ mem = ''             /* current layout member                       */
 jsonPairs = ''       /* current JSON key:value pairs                */
 /* =========================== MAIN =============================== */
 say '==============================================================='
-say 'REC2JSON  : Starting ... '
+say 'REC5JSON  : Starting ... '
 say '==============================================================='
 /* 1) Validate DDs, open streams, print dataset names, write header */
 call validateAndOpenDDs
@@ -133,7 +133,7 @@ if isInDDOpen = 1 then do
 
     /* Parse with chosen layout and produce jsonPairs */
 /*  say 'Record read: ' rec */
-    say 'Key extracted: ' key
+    say 'Key extracted: ' key_v
     say 'layout_loaded.memb : ' layout_loaded.memb
     say 'Layout member: ' memb
     call initParseState rec, memb
@@ -928,7 +928,6 @@ return
 
 parseRecord: procedure expose layouts. jsonPairs recOff rec depval. ctVar. ctVar_keys. ctVar_seen.
   parse arg member, TBA
-  drop depval.
 /*********** PASS 1 -- scan all fields to capture -CT values ****/
   recOff = 1
   do ti=1 to layouts.member.topCount
@@ -944,7 +943,7 @@ parseRecord: procedure expose layouts. jsonPairs recOff rec depval. ctVar. ctVar
   end
 return
 
-parseNode: procedure expose layouts. jsonPairs recOff rec depval. ctVar. ctVar_keys. ctVar_seen.
+parseNode: procedure expose layouts. jsonPairs recOff rec ctVar. ctVar_keys. ctVar_seen.
   parse arg member, idx, path, TBA, mode
   if mode = '' then mode = 'NORMAL'
 
@@ -961,32 +960,43 @@ parseNode: procedure expose layouts. jsonPairs recOff rec depval. ctVar. ctVar_k
   occ = occMin
 
   if depOn <> '' then do
-    val = depLookup(depval., depOn)
+    val = getCtForFieldOrGroup(depOn, name)
     if datatype(val) = 'NUM' then occ = val
     if occ > occMax then occ = occMax
     if occ < occMin then occ = occMin
   end
 
   /* For sibling-CT convention (e.g. WS-CVCAT-CT) */
-  ctName = translate(name) || '-CT'
-  ctEmit = depLookup(depval., ctName)
-  if \datatype(ctEmit,'N') then ctEmit = 0
-
 
   /* -------- GROUP NODE -------- */
   if isGroup then do
 
-  /* OCCURS already computed into 'occ' above */
-/* Use new counter API so emission honors <GROUP>-CT captured in SCAN */
-    ctFromCtVar = getCtForGroup(name)
-    if \datatype(ctFromCtVar,'N') then ctFromCtVar = 0
-    if ctFromCtVar < 0 then ctFromCtVar = 0
-    if ctFromCtVar > occ then ctFromCtVar = occ
-    /* Decide array rendering. We still parse all physical
-       OCCURS to keep recOff aligned, but we only EMIT the
-       first ctFromCtVar instances. */
-    wantArray = (occ > 1)
-    arrCountToEmit = ctFromCtVar
+    ctName  = translate(name)
+    ctEmit  = getCtForGroup(ctName)
+    wantArray      = (occ > 1)
+    arrCountToEmit = min(occ, ctEmit)
+
+    /* While emitting (NORMAL), use the per-element sibling CT */
+    if mode = 'NORMAL' then do     /* NORMAL Mode */
+      if datatype(ctEmit,'N') & ctEmit > 0 then do
+        arrCountToEmit = min(occ, ctEmit + 0)
+      end
+      else do
+        ctFromCtVar = getCtForGroup(name)
+        if \datatype(ctFromCtVar,'N') then ctFromCtVar = 0
+        if ctFromCtVar < 0 then ctFromCtVar = 0
+        arrCountToEmit = min(occ, ctFromCtVar)
+      end
+    end
+    else do                        /* SCAN Mode */
+    /* OCCURS already computed into 'occ' above */
+      ctFromCtVar = getCtForGroup(name)
+      if \datatype(ctFromCtVar,'N') then ctFromCtVar = 0
+      if ctFromCtVar < 0 then ctFromCtVar = 0
+      arrCountToEmit = min(occ, ctFromCtVar)
+    end
+
+    say 'DBG mode = ' mode ' group=' name'-CT occ=' occ ' ctEmit=' ctEmit ' emit=' arrCountToEmit
 
     /* === SINGLE (no array) === */
     if wantArray = 0 then do
@@ -1058,18 +1068,28 @@ parseNode: procedure expose layouts. jsonPairs recOff rec depval. ctVar. ctVar_k
         val = 2
       end
 
-      call maybeRemember depval., name, fullName, val, pictype, usage
+      call maybeRemember name, fullName, val, pictype, usage
 
       /* During SCAN pass, store only -CT fields into ctVar. */
       if mode = 'SCANCT' then do
         if right(translate(name), 3) = '-CT' then do
           ctTail = safeTail(name)  /* e.g., WS-CVCAT-CT -> WS_CVCAT_CT */
-          if datatype(val,'N') then ctVar.ctTail = val + 0
+
+          if datatype(val,'N') then newCt = val + 0
           else do
             tnum = onlyDigits(val) /* defensive: ensure numeric */
             if tnum = '' then tnum = '0'
-            ctVar.ctTail = tnum + 0
+            newCt = tnum + 0
           end
+
+          /* keep the maximum seen for this -CT in SCAN pass */
+          prevCt = 0
+          if symbol('ctVar.'ctTail) = 'VAR' then do
+            if datatype(ctVar.ctTail,'N') then
+              prevCt = ctVar.ctTail + 0
+          end
+          if newCt > prevCt then ctVar.ctTail = newCt
+
           if symbol('ctVar_keys.0') <> 'VAR' then ctVar_keys.0 = 0
           else if \datatype(ctVar_keys.0,'N') then ctVar_keys.0 = 0
           if ctVar_seen.ctTail <> 1 then do
@@ -1086,14 +1106,16 @@ parseNode: procedure expose layouts. jsonPairs recOff rec depval. ctVar. ctVar_k
       /* Skip FILLER in JSON */
         if translate(name) = 'FILLER' then do
            fullName = 'CICS'
-           val = substr(val,1,4)
-           call addPair fullName, val, pictype, usage
+           val_c = substr(val,1,4)
+           call addPair fullName, val_c, pictype, usage
            fullName = 'TBA'
-           val = TBA
-           call addPair fullName, val, pictype, usage
+           val_s = TBA
+           call addPair fullName, val_s, pictype, usage
            fullName = 'EIBTASKN'
-           val = substr(val,15,6)
-           call addPair fullName, val, pictype, usage
+           val_task = substr(val,31,4)
+           val_task = c2x(val_task)
+           val_task = substr(val_task, 1, length(val_task) - 1)
+           call addPair fullName, val_task, pictype, usage
         end
         else do
            call addPair fullName, val, pictype, usage
@@ -1118,17 +1140,25 @@ parseNode: procedure expose layouts. jsonPairs recOff rec depval. ctVar. ctVar_k
             val = 2
         end
 
-        call maybeRemember depval., name, fullName||'['ii']', val, pictype, usage
+        call maybeRemember name, fullName||'['ii']', val, pictype, usage
 
         if mode = 'SCANCT' then do
           if right(translate(name), 3) = '-CT' then do
             ctTail = safeTail(name)
-            if datatype(val,'N') then ctVar.ctTail = val + 0
+
+            if datatype(val,'N') then newCt = val + 0
             else do
               tnum = onlyDigits(val)
               if tnum = '' then tnum = '0'
-              ctVar.ctTail = tnum + 0
+              newCt = tnum + 0
             end
+            prevCt = 0
+            if symbol('ctVar.'ctTail) = 'VAR' then do
+              if datatype(ctVar.ctTail,'N') then prevCt = ctVar.ctTail + 0
+            end
+
+            if newCt > prevCt then ctVar.ctTail = newCt
+
         /* portable guard: ensure ctVar_keys.0 exists and is numeric */
             if symbol('ctVar_keys.0') <> 'VAR' then ctVar_keys.0 = 0
             else if \datatype(ctVar_keys.0,'N') then ctVar_keys.0 = 0
@@ -1281,15 +1311,15 @@ depLookup: procedure
       return dep.short.k
   end
 return 0
-
+             save
 maybeRemember: procedure
-  parse arg dep., short, full, val, pictype, usage
-  if datatype(val,'N') | pos('.',val)>0 | left(val,1)='-' then do
+  parse arg short, full, val, pictype, usage
+/*if datatype(val,'N') | pos('.',val)>0 | left(val,1)='-' then do
     shortU = safeTail(short)
     fullU  = safeTail(full)
     dep.short.shortU = val
     dep.full.fullU   = val
-  end
+  end */
 return
 
 /* sanitize a name for use as a REXX stem tail */
@@ -1537,9 +1567,18 @@ return 0
 getCtForGroup: procedure expose ctVar. ctVar_keys. ctVar_seen.
   parse arg grpName
   if grpName = '' then return 0
-  grpU = translate(grpName)
-  ctField = grpU || '-CT'       /* Step 2: e.g., WS-CVCAT-CT  */
-  keyName = safeTail(ctField)   /* Step 3: WS_CVCAT_CT        */
+  grpU = strip(translate(grpName))
+
+  if right(grpU, 3) = '-CT' then
+    ctField = grpU
+  else
+    ctField = grpU || '-CT'       /* Step 2: e.g., WS-CVCAT-CT  */
+
+  keyName = safeTail(ctField)     /* Step 3: WS_CVCAT_CT        */
+
+  /* default when no match is found */
+  notFoundDefault = 1
+  tnum = notFoundDefault
 
   /* Make a safe numeric loop bound (portable on all TSO/E levels) */
   limit = 0
@@ -1547,18 +1586,37 @@ getCtForGroup: procedure expose ctVar. ctVar_keys. ctVar_seen.
     if datatype(ctVar_keys.0,'N') then limit = ctVar_keys.0 + 0
   end
 
-  if limit = 0 then return 0    /* Nothing captured yet       */
+  /* Nothing captured yet -> return default (1) */
+  if limit = 0 then return tnum
 
-  do i = 1 to limit  /* Step 4: search like displayCtVar */
+  /* Search like displayCtVar */
+  do i = 1 to limit             /* Step 4: search like displayCtVar */
     if symbol('ctVar_keys.'i) <> 'VAR' then iterate
     k = ctVar_keys.i
     if k = keyName then do      /* Step 5: found -> return value   */
       v = ctVar.k
       if datatype(v,'N') then return v + 0
       /* Defensive: if value came as text, coerce digits */
-      tnum = onlyDigits(v)
-      if tnum = '' then tnum = '0'
-      return tnum + 0
+      tdigits = onlyDigits(v)
+      if tdigits = '' then tdigits = '0'
+      return tdigits + 0
     end
   end
-return 0
+  /* No match -> default (1) */
+  return tnum
+/* ===============================================================
+  getCtForFieldOrGroup: first tries a direct field counter from ctVar.,
+  else falls back to the group's own <name>-CT via getCtForGroup(name).
+   =============================================================== */
+getCtForFieldOrGroup: procedure expose ctVar. ctVar_keys.
+  parse arg depOnName, grpName
+  key = safeTail(depOnName)
+  if symbol('ctVar.'key) = 'VAR' then do
+    v = ctVar.key
+    if datatype(v,'N') then return v + 0
+    t = onlyDigits(v)
+    if t = '' then t = '0'
+    return t + 0
+  end
+  /* Fallback: use the group's <name>-CT captured in ctVar. */
+  return getCtForGroup(grpName)
